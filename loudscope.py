@@ -5,7 +5,8 @@ Usage:
   loudscope.py install                 Install the Finder Quick Actions (re-run to update)
   loudscope.py uninstall               Remove everything Loudscope installed
   loudscope.py doctor                  Check dependencies and the installation
-  loudscope.py analyze FILE...         Analyze and open an HTML report
+  loudscope.py analyze FILE...         Analyze; show a summary dialog (graph on request)
+      --html / --text                  Open the HTML report directly / print the summary
   loudscope.py gain FILE...            Pick a gain in a dialog and export a new file
   loudscope.py gain --db 3 FILE...     No dialog: +3 dB
   loudscope.py gain --lufs -14 FILE... No dialog: match -14 LUFS integrated
@@ -504,7 +505,65 @@ def write_report(results):
     return out
 
 
-def cmd_analyze(paths):
+def summary_line(loud):
+    """One line for the Finder comment (plain ASCII minus so Spotlight search works)."""
+    return "Loudscope: I %s LUFS · LRA %s LU · TP %s dBTP · SP %s dBFS" % tuple(
+        fmt_db(loud.get(k)).replace("−", "-") for k in ("I", "LRA", "TP", "SP"))
+
+
+FINDER_COMMENT_SCRIPT = '''on run argv
+	repeat with i from 1 to (count of argv) by 2
+		set f to POSIX file (item i of argv) as alias
+		set newLine to item (i + 1) of argv
+		tell application "Finder"
+			set old to comment of f
+			set kept to {}
+			repeat with p in paragraphs of old
+				if p does not start with "Loudscope:" and (length of p) > 0 then set end of kept to (p as text)
+			end repeat
+			set end of kept to newLine
+			set AppleScript's text item delimiters to linefeed
+			set comment of f to (kept as text)
+			set AppleScript's text item delimiters to ""
+		end tell
+	end repeat
+end run'''
+
+
+def write_finder_comments(pairs):
+    """Put the loudness summary into each file's Finder comment (shown in Get Info, ⌘I)."""
+    if not pairs or not load_config().get("finder_comment", True):
+        return
+    args = []
+    for path, loud in pairs:
+        args += [os.path.abspath(path), summary_line(loud)]
+    p = subprocess.run(["osascript", "-e", FINDER_COMMENT_SCRIPT] + args, capture_output=True, text=True)
+    if p.returncode != 0:
+        log("finder comment failed: " + p.stderr.strip())
+
+
+def dialog_text(r):
+    name = os.path.basename(r["path"])
+    if "error" in r:
+        return "%s\n%s" % (name, r["error"])
+    loud = r["loud"]
+    I, TP = loud.get("I"), loud.get("TP")
+    svals = [v for v in loud["S"] if v is not None]
+    lines = [name,
+             "Integrated  %s LUFS" % fmt_db(I),
+             "Range  %s LU" % fmt_db(loud.get("LRA")),
+             "True Peak  %s dBTP" % fmt_db(TP),
+             "Sample Peak  %s dBFS" % fmt_db(loud.get("SP")),
+             "Max Short-term  %s LUFS" % fmt_db(max(svals) if svals else None)]
+    if I is not None and I > -70:
+        g = -14.0 - I
+        tp = None if TP is None else TP + g
+        lines.append("To −14 LUFS: %s dB → TP %s dBTP%s" % (
+            fmt_db(g, 1, True), fmt_db(tp), " (needs limiter)" if tp is not None and tp > TP_CEILING else ""))
+    return "\n".join(lines)
+
+
+def cmd_analyze(paths, mode="dialog"):
     results = []
     for p in paths:
         try:
@@ -512,10 +571,23 @@ def cmd_analyze(paths):
         except Exception as e:
             log("analyze %s: %r" % (p, e))
             results.append({"path": p, "info": {}, "error": str(e)})
-    out = write_report(results)
+    ok = [r for r in results if "error" not in r]
     if not QUIET:
-        subprocess.run(["open", out])
-    print(out)
+        write_finder_comments([(r["path"], r["loud"]) for r in ok])
+    if QUIET or mode == "text":
+        print("\n\n".join(dialog_text(r) for r in results))
+        return 0 if ok else 1
+    if mode == "html":
+        subprocess.run(["open", write_report(results)])
+        return 0
+    text = "\n\n".join(dialog_text(r) for r in results)
+    ans = osa('on run argv\nactivate\nset r to display dialog (item 1 of argv) with title "Loudscope" '
+              'buttons {"Change Gain…", "Show Graph", "OK"} default button 3 cancel button 3\n'
+              'return button returned of r\nend run', text)
+    if ans == "Show Graph":
+        subprocess.run(["open", write_report(results)])
+    elif ans == "Change Gain…":
+        return cmd_gain([r["path"] for r in ok]) if ok else 0
     return 0
 
 
@@ -693,6 +765,8 @@ def cmd_gain(paths, mode=None, limit_policy=None):
                 fmt_db(g, 1, True), " + limiter" if limit else "",
                 fmt_db(after.get("I")), fmt_db(after.get("TP")))
             done.append(out)
+            if not QUIET:
+                write_finder_comments([(out, after)])
             log("gain %s -> %s: %s" % (p, out, msg))
             print("%s | %s" % (out, msg))
             notify(os.path.basename(out), msg)
@@ -828,8 +902,11 @@ def cmd_install():
     if os.path.realpath(__file__) != os.path.realpath(dst):
         shutil.copy2(os.path.abspath(__file__), dst)
     os.chmod(dst, 0o755)
+    cfg = load_config()
     with open(CONFIG_PATH, "w") as f:
-        json.dump({"version": VERSION, "python": python, "ffmpeg_dir": ffdir}, f, indent=2)
+        cfg.update({"version": VERSION, "python": python, "ffmpeg_dir": ffdir})
+        cfg.setdefault("finder_comment", True)
+        json.dump(cfg, f, indent=2)
     os.makedirs(SERVICES_DIR, exist_ok=True)
     for menu, cmd in QUICK_ACTIONS:
         wf = os.path.join(SERVICES_DIR, menu + ".workflow")
@@ -928,7 +1005,7 @@ def main(argv):
         return cmd_uninstall()
     if cmd == "doctor":
         return cmd_doctor()
-    mode, limit_policy, paths = None, None, []
+    mode, limit_policy, paths, view = None, None, [], "dialog"
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -940,6 +1017,8 @@ def main(argv):
             limit_policy = "limit"
         elif a == "--no-limit":
             limit_policy = "raw"
+        elif a in ("--html", "--text"):
+            view = a[2:]
         elif a == "--quiet":
             QUIET = True
         else:
@@ -951,7 +1030,7 @@ def main(argv):
     paths = [p for p in paths if os.path.isfile(p)]
     if not paths:
         return 1
-    return cmd_analyze(paths) if cmd == "analyze" else cmd_gain(paths, mode, limit_policy)
+    return cmd_analyze(paths, view) if cmd == "analyze" else cmd_gain(paths, mode, limit_policy)
 
 
 if __name__ == "__main__":

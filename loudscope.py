@@ -525,6 +525,9 @@ FINDER_COMMENT_SCRIPT = '''on run argv
 			set AppleScript's text item delimiters to linefeed
 			set comment of f to (kept as text)
 			set AppleScript's text item delimiters to ""
+			try
+				update f
+			end try
 		end tell
 	end repeat
 end run'''
